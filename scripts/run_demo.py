@@ -1,82 +1,120 @@
-"""Run the first Heston pricing and implied-volatility demonstration."""
-from pathlib import Path
+"""Part 5: Monte Carlo for the Heston variance process, and the smile it generates.
+
+Parameters are illustrative (not calibrated) and satisfy the Feller condition
+2*kappa*theta >= xi^2, so the CIR variance stays strictly positive.
+
+Figures (outputs/):
+  variance_paths.png                 MC CIR paths, MC mean vs exact mean, 5-95% band
+  variance_terminal_distribution.png MC histogram of v_T vs exact non-central chi-square law
+  asset_paths.png                    Simulated spot paths
+  heston_smile.png                   Smile from Heston MC (rho<0 and rho=0) vs Black-Scholes flat vol
+  mc_convergence.png                 ATM call price vs number of paths
+"""
 import sys
+from dataclasses import replace
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import ncx2
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-from src.black76 import implied_volatility
 from src.heston import HestonParams, simulate_heston_paths
 from src.monte_carlo import price_european_mc
+from src.smile import heston_smile_mc
+
+BLUE, RED, GREY = "#1f77b4", "#d62728", "0.6"
+P = HestonParams(kappa=4.0, theta=0.04, xi=0.50, rho=-0.70, v0=0.09)
+S0, R, Q, T = 100.0, 0.03, 0.0, 1.0
+STEPS, PATHS = 252, 200_000
+
+
+def style():
+    plt.rcParams.update({"font.size": 11, "axes.spines.top": False, "axes.spines.right": False,
+                         "axes.grid": True, "grid.alpha": 0.25})
 
 
 def main() -> None:
     out = ROOT / "outputs"
     out.mkdir(exist_ok=True)
-    # Fixed, illustrative risk-neutral parameters; this is not a market calibration.
-    p = HestonParams(kappa=2.0, theta=0.04, xi=0.60, rho=-0.70, v0=0.09)
-    s0, r, q, maturity, steps = 100.0, 0.03, 0.0, 1.0, 252
-    forward = s0 * np.exp((r - q) * maturity)
-    discount = np.exp(-r * maturity)
+    style()
+    p = P
+    feller = 2 * p.kappa * p.theta - p.xi**2
+    print(f"Parameters: {p}\nFeller 2*kappa*theta - xi^2 = {feller:+.3f} (>= 0 means variance never hits zero)")
+    forward, disc = S0 * np.exp((R - Q) * T), np.exp(-R * T)
+    paths, var = simulate_heston_paths(S0, p, R, Q, T, STEPS, PATHS, seed=2026, scheme="qe")
+    t = np.linspace(0, T, STEPS + 1)
 
-    paths, variance = simulate_heston_paths(s0, p, r, q, maturity, steps, 100_000, seed=2026)
-    times = np.linspace(0, maturity, steps + 1)
+    # 1. Variance paths with exact mean E[v_t] = theta + (v0 - theta) e^{-kappa t}
     fig, ax = plt.subplots(figsize=(9, 5))
-    for i in range(12):
-        ax.plot(times, variance[i], lw=1, alpha=0.8)
-    ax.set(title="Illustrative Heston variance paths", xlabel="Time (years)", ylabel="Variance")
-    fig.tight_layout(); fig.savefig(out / "variance_paths.png", dpi=180); plt.close(fig)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for i in range(12):
-        ax.plot(times, paths[i], lw=1, alpha=0.8)
-    ax.set(title="Illustrative Heston asset-price paths", xlabel="Time (years)", ylabel="Spot price")
-    fig.tight_layout(); fig.savefig(out / "asset_paths.png", dpi=180); plt.close(fig)
+    for i in range(8):
+        ax.plot(t, var[i], color=GREY, lw=0.8, alpha=0.8)
+    ax.fill_between(t, *np.percentile(var, [5, 95], axis=0), color=BLUE, alpha=0.2, label="MC 5-95% band")
+    ax.plot(t, var.mean(axis=0), color=RED, lw=2, label="MC mean")
+    ax.plot(t, p.theta + (p.v0 - p.theta) * np.exp(-p.kappa * t), "k--", lw=1.2, label="Exact mean")
+    ax.axhline(p.theta, color="k", lw=0.8, ls=":", label=r"Long-run level $\theta$")
+    ax.set(title="Monte Carlo paths of the Heston (CIR) variance process", xlabel="Time (years)",
+           ylabel="Variance $v_t$")
+    ax.legend(frameon=False)
+    fig.tight_layout(); fig.savefig(out / "variance_paths.png", dpi=150); plt.close(fig)
 
-    strike = forward
-    conv_rows = []
-    for n in (25_000, 50_000, 100_000):
-        ss, _ = simulate_heston_paths(s0, p, r, q, maturity, steps, n, seed=7000 + n)
-        result = price_european_mc(ss[:, -1], strike, maturity, r, "call", antithetic=True)
-        conv_rows.append({"paths": n, "price": result.price, "standard_error": result.standard_error})
-    conv = pd.DataFrame(conv_rows)
+    # 2. Terminal law: v_T = c * ncx2(d, lam) exactly (CIR transition density)
+    c = p.xi**2 * (1 - np.exp(-p.kappa * T)) / (4 * p.kappa)
+    d, lam = 4 * p.kappa * p.theta / p.xi**2, p.v0 * np.exp(-p.kappa * T) / c
+    x = np.linspace(1e-4, np.percentile(var[:, -1], 99.5), 400)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(var[:, -1], bins=80, density=True, color=BLUE, alpha=0.45, label="Monte Carlo")
+    ax.plot(x, ncx2.pdf(x / c, d, lam) / c, color=RED, lw=2, label=r"Exact (non-central $\chi^2$)")
+    ax.set(title=f"Distribution of $v_T$ at T={T:g}y: simulation vs theory", xlabel="Variance $v_T$", ylabel="Density")
+    ax.legend(frameon=False)
+    fig.tight_layout(); fig.savefig(out / "variance_terminal_distribution.png", dpi=150); plt.close(fig)
+    print(f"E[v_T]: MC {var[:, -1].mean():.5f} vs exact {p.theta + (p.v0 - p.theta) * np.exp(-p.kappa * T):.5f};"
+          f"  min v over all paths: {var.min():.2e}")
+
+    # 3. Spot paths
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for i in range(10):
+        ax.plot(t, paths[i], lw=0.8, alpha=0.7)
+    ax.set(title="Simulated Heston asset-price paths", xlabel="Time (years)", ylabel="Spot price")
+    fig.tight_layout(); fig.savefig(out / "asset_paths.png", dpi=150); plt.close(fig)
+
+    # 4. Smile: price OTM options from the simulated S_T, invert Black-Scholes (Black-76) for each strike
+    strikes = forward * np.exp(np.linspace(-0.3, 0.3, 25))
+    m = np.log(strikes / forward)
+    smile = heston_smile_mc(S0, forward, strikes, T, p, disc, n_paths=PATHS, steps_per_year=STEPS)
+    smile_flat = heston_smile_mc(S0, forward, strikes, T, replace(p, rho=0.0), disc, n_paths=PATHS,
+                                 steps_per_year=STEPS)
+    atm = float(np.interp(0.0, m, smile))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(m, smile * 100, "-o", ms=5, color=RED, lw=2, label=rf"Heston MC, $\rho={p.rho}$")
+    ax.plot(m, smile_flat * 100, "-o", ms=4, color=BLUE, lw=1.5, alpha=0.8, label=r"Heston MC, $\rho=0$")
+    ax.axhline(atm * 100, color="k", ls="--", lw=1.2, label="Black-Scholes (constant vol)")
+    ax.set(title="Smile generated by Heston Monte Carlo (T=1y)", xlabel="log-moneyness ln(K/F)",
+           ylabel="Implied volatility (%)")
+    ax.legend(frameon=False)
+    fig.tight_layout(); fig.savefig(out / "heston_smile.png", dpi=150); plt.close(fig)
+    pd.DataFrame(dict(log_moneyness=m, strike=strikes, iv_rho_neg=smile, iv_rho_zero=smile_flat)
+                 ).to_csv(out / "heston_smile.csv", index=False)
+
+    # 5. Convergence of an ATM call
+    rows = []
+    for n in (12_500, 25_000, 50_000, 100_000, 200_000):
+        ss, _ = simulate_heston_paths(S0, p, R, Q, T, STEPS, n, seed=7000 + n, scheme="qe")
+        res = price_european_mc(ss[:, -1], forward, T, R, "call", antithetic=True)
+        rows.append(dict(paths=n, price=res.price, standard_error=res.standard_error))
+    conv = pd.DataFrame(rows)
     conv.to_csv(out / "convergence.csv", index=False)
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.errorbar(conv.paths, conv.price, yerr=1.96 * conv.standard_error, fmt="o-", capsize=4)
-    ax.set(title="Monte Carlo convergence (95% normal intervals)", xlabel="Number of paths", ylabel="ATM call price")
-    fig.tight_layout(); fig.savefig(out / "mc_convergence.png", dpi=180); plt.close(fig)
-
-    strikes = np.linspace(0.75 * forward, 1.25 * forward, 21)
-    rows = []
-    for k in strikes:
-        kind = "put" if k < forward else "call"
-        res = price_european_mc(paths[:, -1], float(k), maturity, r, kind, antithetic=True)
-        iv = implied_volatility(res.price, forward, float(k), maturity, discount, kind)
-        rows.append({"strike": k, "log_moneyness": np.log(k / forward), "option_type": kind,
-                     "price": res.price, "standard_error": res.standard_error, "implied_volatility": iv})
-    smile = pd.DataFrame(rows)
-    if smile.implied_volatility.isna().any() or not np.isfinite(smile.implied_volatility).all():
-        raise FloatingPointError("Smile contains invalid implied volatilities.")
-    smile.to_csv(out / "heston_smile.csv", index=False)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(smile.strike, smile.price, "o-", ms=4)
-    ax.set(title="Heston Monte Carlo option prices", xlabel="Strike", ylabel="Option price")
-    fig.tight_layout(); fig.savefig(out / "option_prices.png", dpi=180); plt.close(fig)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(smile.log_moneyness, 100 * smile.implied_volatility, "o-", ms=4,
-            label="Heston MC (illustrative parameters)")
-    ax.set(title="Heston-generated implied-volatility smile (1Y)",
-           xlabel="Log-forward-moneyness ln(K/F)", ylabel="Implied volatility (%)")
-    ax.legend(frameon=False); fig.tight_layout(); fig.savefig(out / "heston_smile.png", dpi=180); plt.close(fig)
-    print("Illustrative parameters:", p)
-    print("Forward:", forward, "Discount:", discount)
-    print("Variance sample mean at T:", float(variance[:, -1].mean()))
-    print("Convergence (ATM call):\n", conv.to_string(index=False))
-    print("Smile IV range (%):", 100 * smile.implied_volatility.min(), "to", 100 * smile.implied_volatility.max())
+    ax.errorbar(conv.paths, conv.price, yerr=1.96 * conv.standard_error, fmt="o-", capsize=4, color=BLUE)
+    ax.set(xscale="log", title="Monte Carlo convergence (95% interval)", xlabel="Number of paths",
+           ylabel="ATM call price")
+    fig.tight_layout(); fig.savefig(out / "mc_convergence.png", dpi=150); plt.close(fig)
+    print(f"Smile: ATM IV {atm:.1%}; IV at ln(K/F)=-0.3: {smile[0]:.1%}, at +0.3: {smile[-1]:.1%}")
     print("Wrote figures and CSV data to", out)
 
 

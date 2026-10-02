@@ -95,7 +95,9 @@ def _simulate_qe(s, v, rng, batch, antithetic, r, q, dt, steps, p):
         psi = s2 / np.maximum(m * m, 1e-300)
         quad = psi <= psi_c
         psi_q = np.maximum(psi, 1e-12)
-        b2 = 2 / psi_q - 1 + np.sqrt(2 / psi_q) * np.sqrt(np.maximum(2 / psi_q - 1, 0))
+        # b2 is only used where psi <= 1.5 (quadratic branch); clip so the masked-out
+        # branch cannot produce negative square roots.
+        b2 = np.maximum(2 / psi_q - 1 + np.sqrt(2 / psi_q) * np.sqrt(np.maximum(2 / psi_q - 1, 0)), 0.0)
         a = m / (1 + b2)
         pe = (psi - 1) / (psi + 1)
         beta = (1 - pe) / np.maximum(m, 1e-300)
@@ -107,6 +109,10 @@ def _simulate_qe(s, v, rng, batch, antithetic, r, q, dt, steps, p):
             mq = np.exp(a_coef * a * b2 / (1 - 2 * a_coef * a)) / np.sqrt(1 - 2 * a_coef * a)
             me = pe + beta * (1 - pe) / (beta - a_coef)
         mgf = np.where(quad, mq, me)
+        if not np.all(np.isfinite(mgf) & (mgf > 0)):
+            raise FloatingPointError(
+                "QE martingale correction is invalid (parameters too extreme for this step size); "
+                "use more time steps.")
         k0 = -np.log(mgf) - (k1 + 0.5 * k3) * vj
         logs = logs + (r - q) * dt + k0 + k1 * vj + k2 * vn + np.sqrt(np.maximum(k3 * vj + k4 * vn, 0)) * zs
         s[:, j + 1] = np.exp(logs)
